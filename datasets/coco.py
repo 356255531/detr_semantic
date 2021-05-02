@@ -6,12 +6,43 @@ Mostly copy-paste from https://github.com/pytorch/vision/blob/13b35ff/references
 """
 from pathlib import Path
 
+import os
 import torch
 import torch.utils.data
 import torchvision
 from pycocotools import mask as coco_mask
+import random as rd
+
+import gensim.downloader as api
 
 import datasets.transforms as T
+
+def get_label_semantic():
+    wv = api.load('word2vec-google-news-300')
+    CLASSES = [
+        'NULL', 'person', 'bicycle', 'car', 'motorcycle', 'airplane', 'bus',
+        'train', 'truck', 'boat', 'traffic light', 'fire hydrant', 'NULL',
+        'stop sign', 'parking meter', 'bench', 'bird', 'cat', 'dog', 'horse',
+        'sheep', 'cow', 'elephant', 'bear', 'zebra', 'giraffe', 'NULL', 'backpack',
+        'umbrella', 'NULL', 'NULL', 'handbag', 'tie', 'suitcase', 'frisbee', 'skis',
+        'snowboard', 'sports ball', 'kite', 'baseball bat', 'baseball glove',
+        'skateboard', 'surfboard', 'tennis racket', 'bottle', 'NULL', 'wine glass',
+        'cup', 'fork', 'knife', 'spoon', 'bowl', 'banana', 'apple', 'sandwich',
+        'orange', 'broccoli', 'carrot', 'hot dog', 'pizza', 'donut', 'cake',
+        'chair', 'couch', 'potted plant', 'bed', 'NULL', 'dining table', 'NULL',
+        'NULL', 'toilet', 'NULL', 'tv', 'laptop', 'mouse', 'remote', 'keyboard',
+        'cell phone', 'microwave', 'oven', 'toaster', 'sink', 'refrigerator', 'NULL',
+        'book', 'clock', 'vase', 'scissors', 'teddy bear', 'hair drier',
+        'toothbrush'
+    ]
+    label_semantic = []
+    for c in CLASSES:
+        cs = c.split(' ')
+        if len(cs) == 1:
+            label_semantic.append(wv[cs[0]])
+        else:
+            label_semantic.append(sum([wv[_] for _ in cs]))
+    return torch.tensor(label_semantic)
 
 
 class CocoDetection(torchvision.datasets.CocoDetection):
@@ -19,6 +50,12 @@ class CocoDetection(torchvision.datasets.CocoDetection):
         super(CocoDetection, self).__init__(img_folder, ann_file)
         self._transforms = transforms
         self.prepare = ConvertCocoPolysToMask(return_masks)
+        if os.path.exists('label_semantic.pt'):
+            self.label_semantic = torch.load('label_semantic.pt')
+        else:
+            label_semantic = get_label_semantic()
+            torch.save(label_semantic, 'label_semantic.pt')
+            self.label_semantic = label_semantic
 
     def __getitem__(self, idx):
         img, target = super(CocoDetection, self).__getitem__(idx)
@@ -27,7 +64,11 @@ class CocoDetection(torchvision.datasets.CocoDetection):
         img, target = self.prepare(img, target)
         if self._transforms is not None:
             img, target = self._transforms(img, target)
-        return img, target
+        target['semantics'] = self.label_semantic[target['labels']]
+        if target['boxes'].shape[0] != 0:
+            return img, target
+        else:
+            return self[rd.choice(range(len(self.ids)))]
 
 
 def convert_coco_poly_to_mask(segmentations, height, width):

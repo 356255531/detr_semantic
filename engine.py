@@ -6,13 +6,12 @@ import math
 import os
 import sys
 from typing import Iterable
-
 import torch
 
 import util.misc as utils
 from datasets.coco_eval import CocoEvaluator
 from datasets.panoptic_eval import PanopticEvaluator
-
+from util.misc import semantic_targets_preprocessing
 
 def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                     data_loader: Iterable, optimizer: torch.optim.Optimizer,
@@ -28,8 +27,9 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
     for samples, targets in metric_logger.log_every(data_loader, print_freq, header):
         samples = samples.to(device)
         targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+        targets, semantics = semantic_targets_preprocessing(targets)
 
-        outputs = model(samples)
+        outputs = model(samples, semantics)
         loss_dict = criterion(outputs, targets)
         weight_dict = criterion.weight_dict
         losses = sum(loss_dict[k] * weight_dict[k] for k in loss_dict.keys() if k in weight_dict)
@@ -88,8 +88,9 @@ def evaluate(model, criterion, postprocessors, data_loader, base_ds, device, out
     for samples, targets in metric_logger.log_every(data_loader, 10, header):
         samples = samples.to(device)
         targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+        targets, semantics = semantic_targets_preprocessing(targets, idx=0)
 
-        outputs = model(samples)
+        outputs = model(samples, semantics)
         loss_dict = criterion(outputs, targets)
         weight_dict = criterion.weight_dict
 

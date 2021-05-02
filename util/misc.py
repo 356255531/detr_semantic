@@ -5,6 +5,7 @@ Misc functions, including distributed helpers.
 Mostly copy-paste from torchvision references.
 """
 import os
+import random as rd
 import subprocess
 import time
 from collections import defaultdict, deque
@@ -465,3 +466,23 @@ def interpolate(input, size=None, scale_factor=None, mode="nearest", align_corne
         return _new_empty_tensor(input, output_shape)
     else:
         return torchvision.ops.misc.interpolate(input, size, scale_factor, mode, align_corners)
+
+def semantic_targets_preprocessing(targets, idx=None):
+    semantic_targets = []
+    semantics = []
+    for t in targets:
+        if idx is None:
+            indices = list(range(t['boxes'].shape[0]))
+            rd.shuffle(indices)
+            idx = indices[0]
+        s_target = t.copy()
+        label = s_target['labels'][idx]
+        keep = s_target['labels'] == label
+        s_target['boxes'] = s_target['boxes'][keep]
+        s_target['labels'] = s_target['labels'][keep]
+        semantic = s_target['semantics'][idx].unsqueeze(0)
+        del s_target['semantics']
+        semantic_targets.append(s_target)
+        semantics.append(semantic)
+    semantics = torch.cat(semantics, dim=0)
+    return semantic_targets, semantics

@@ -20,7 +20,7 @@ from .transformer import build_transformer
 
 class DETR(nn.Module):
     """ This is the DETR module that performs object detection """
-    def __init__(self, backbone, transformer, num_classes, num_queries, aux_loss=False):
+    def __init__(self, backbone, transformer, num_classes, num_queries, semantic_query_dim, aux_loss=False):
         """ Initializes the model.
         Parameters:
             backbone: torch module of the backbone to be used. See backbone.py
@@ -36,15 +36,18 @@ class DETR(nn.Module):
         hidden_dim = transformer.d_model
         self.class_embed = nn.Linear(hidden_dim, num_classes + 1)
         self.bbox_embed = MLP(hidden_dim, hidden_dim, 4, 3)
-        self.query_embed = nn.Embedding(num_queries, hidden_dim)
+        self.query_positional_encoding = nn.Embedding(num_queries, hidden_dim)
+        self.proj = nn.Linear(semantic_query_dim, hidden_dim)
         self.input_proj = nn.Conv2d(backbone.num_channels, hidden_dim, kernel_size=1)
         self.backbone = backbone
         self.aux_loss = aux_loss
 
-    def forward(self, samples: NestedTensor):
-        """ The forward expects a NestedTensor, which consists of:
-               - samples.tensor: batched images, of shape [batch_size x 3 x H x W]
-               - samples.mask: a binary mask of shape [batch_size x H x W], containing 1 on padded pixels
+    def forward(self, samples: NestedTensor, semantics):
+        """ The forward expects
+                - a NestedTensor, which consists of:
+                    - samples.tensor: batched images, of shape [batch_size x 3 x Ha x W]
+                    - samples.mask: a binary mask of shape [batch_size x H x W], containing 1 on padded pixels
+                - a torch.tensor of shape [semantic_query_batch_size x semantic_query_dim]
 
             It returns a dict with the following elements:
                - "pred_logits": the classification logits (including no-object) for all queries.
@@ -62,7 +65,11 @@ class DETR(nn.Module):
 
         src, mask = features[-1].decompose()
         assert mask is not None
-        hs = self.transformer(self.input_proj(src), mask, self.query_embed.weight, pos[-1])[0]
+
+        bs = semantics.shape[0]
+        query = self.proj(semantics).unsqueeze(1).repeat([1, self.num_queries, 1]) + self.query_positional_encoding.weight.unsqueeze(0).repeat([bs, 1, 1]) # [semantic_query_batch_size x 100 x hidden_size]
+        query = query.permute([1, 0, 2]) # [100 x semantic_query_batch_size x hidden_size]
+        hs = self.transformer(self.input_proj(src), mask, query, pos[-1])[0]
 
         outputs_class = self.class_embed(hs)
         outputs_coord = self.bbox_embed(hs).sigmoid()
@@ -326,6 +333,7 @@ def build(args):
         transformer,
         num_classes=num_classes,
         num_queries=args.num_queries,
+        semantic_query_dim=args.semantic_query_dim,
         aux_loss=args.aux_loss,
     )
     if args.masks:
