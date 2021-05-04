@@ -5,6 +5,7 @@ Misc functions, including distributed helpers.
 Mostly copy-paste from torchvision references.
 """
 import os
+import random as rd
 import subprocess
 import time
 from collections import defaultdict, deque
@@ -465,3 +466,33 @@ def interpolate(input, size=None, scale_factor=None, mode="nearest", align_corne
         return _new_empty_tensor(input, output_shape)
     else:
         return torchvision.ops.misc.interpolate(input, size, scale_factor, mode, align_corners)
+
+
+def semantic_targets_preprocessing(targets, idx=None, neg_samples=0):
+    semantic_targets = []
+    semantics = []
+    for t in targets:
+        s_target = t.copy()
+        if idx is None:
+            label_idx = torch.randint(s_target['labels'].shape[0], (1,))
+            keep = s_target['labels'] == s_target['labels'][label_idx]
+        else:
+            label_idx = torch.tensor([idx])
+            keep = s_target['labels'] == s_target['labels'][label_idx]
+
+        semantic = s_target['semantics'].detach().clone()[label_idx]
+        s_target['boxes'] = s_target['boxes'][keep]
+        s_target['labels'] = s_target['labels'][keep]
+        del s_target['semantics']
+        neg_semantic = s_target['neg_semantics'].detach().clone()
+        neg_semantic_idx = torch.randint(neg_semantic.shape[0], (semantic.shape[0] * neg_samples,))
+        semantic = torch.cat([semantic, neg_semantic[neg_semantic_idx]], dim=0).unsqueeze(0)
+        del s_target['neg_semantics']
+        pos_mask = torch.zeros((semantic.shape[1],)).long()
+        pos_mask[0] = 1
+        s_target['pos_mask'] = pos_mask
+
+        semantic_targets.append(s_target)
+        semantics.append(semantic)
+    semantics = torch.cat(semantics, dim=0)
+    return semantic_targets, semantics
