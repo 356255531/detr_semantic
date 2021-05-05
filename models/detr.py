@@ -8,7 +8,7 @@ from torch import nn
 
 from util import box_ops
 from util.misc import (NestedTensor, nested_tensor_from_tensor_list,
-                       accuracy, get_world_size, interpolate,
+                       get_world_size, interpolate,
                        is_dist_avail_and_initialized)
 
 from .backbone import build_backbone
@@ -34,17 +34,20 @@ class DETR(nn.Module):
         self.num_queries = num_queries
         self.transformer = transformer
         hidden_dim = transformer.d_model
-        self.class_embed = nn.Linear(hidden_dim, num_classes + 1)
+        self.match_score_emb = nn.Linear(hidden_dim, 2)
         self.bbox_embed = MLP(hidden_dim, hidden_dim, 4, 3)
-        self.query_embed = nn.Embedding(num_queries, hidden_dim)
+        self.semantic_queries = nn.Embedding(num_classes, hidden_dim)
+        self.query_positional_encoding = nn.Embedding(num_queries, hidden_dim)
         self.input_proj = nn.Conv2d(backbone.num_channels, hidden_dim, kernel_size=1)
         self.backbone = backbone
         self.aux_loss = aux_loss
 
-    def forward(self, samples: NestedTensor):
-        """ The forward expects a NestedTensor, which consists of:
-               - samples.tensor: batched images, of shape [batch_size x 3 x H x W]
-               - samples.mask: a binary mask of shape [batch_size x H x W], containing 1 on padded pixels
+    def forward(self, samples: NestedTensor, pos_labels, neg_labels):
+        """ The forward expects
+                - a NestedTensor, which consists of:
+                    - samples.tensor: batched images, of shape [batch_size x 3 x Ha x W]
+                    - samples.mask: a binary mask of shape [batch_size x H x W], containing 1 on padded pixels
+                - a torch.tensor of shape [semantic_query_batch_size x semantic_query_dim]
 
             It returns a dict with the following elements:
                - "pred_logits": the classification logits (including no-object) for all queries.
@@ -62,22 +65,34 @@ class DETR(nn.Module):
 
         src, mask = features[-1].decompose()
         assert mask is not None
-        hs = self.transformer(self.input_proj(src), mask, self.query_embed.weight, pos[-1])[0]
+        bs = pos_labels.shape[0]
+        pos_queries = self.semantic_queries(pos_labels.reshape(-1, 1).repeat([1, self.num_queries]))
+        pos_queries += self.query_positional_encoding.weight.unsqueeze(0).repeat([bs, 1, 1])
+        pos_queries = pos_queries.permute([1, 0, 2])
 
-        outputs_class = self.class_embed(hs)
-        outputs_coord = self.bbox_embed(hs).sigmoid()
-        out = {'pred_logits': outputs_class[-1], 'pred_boxes': outputs_coord[-1]}
+        neg_queries = self.semantic_queries(neg_labels.reshape(-1, 1).repeat([1, self.num_queries]))
+        neg_queries += self.query_positional_encoding.weight.unsqueeze(0).repeat([bs, 1, 1])
+        neg_queries = neg_queries.permute([1, 0, 2])
+
+        transformer_input = self.input_proj(src)
+        pos_hs = self.transformer(transformer_input, mask, pos_queries, pos[-1])[0]
+        neg_hs = self.transformer(transformer_input, mask, neg_queries, pos[-1])[0]
+
+        outputs_pos_match_score = self.match_score_emb(pos_hs)
+        outputs_neg_match_score = self.match_score_emb(neg_hs)
+        outputs_coord = self.bbox_embed(pos_hs).sigmoid()
+        out = {'pred_pos_match_scores': outputs_pos_match_score[-1], 'pred_neg_match_scores': outputs_neg_match_score[-1], 'pred_boxes': outputs_coord[-1]}
         if self.aux_loss:
-            out['aux_outputs'] = self._set_aux_loss(outputs_class, outputs_coord)
+            out['aux_outputs'] = self._set_aux_loss(outputs_pos_match_score, outputs_neg_match_score, outputs_coord)
         return out
 
     @torch.jit.unused
-    def _set_aux_loss(self, outputs_class, outputs_coord):
+    def _set_aux_loss(self, outputs_pos_match_score, outputs_neg_match_score, outputs_coord):
         # this is a workaround to make torchscript happy, as torchscript
         # doesn't support dictionary with non-homogeneous values, such
         # as a dict having both a Tensor and a list.
-        return [{'pred_logits': a, 'pred_boxes': b}
-                for a, b in zip(outputs_class[:-1], outputs_coord[:-1])]
+        return [{'pred_pos_match_scores': a, 'pred_neg_match_scores': b,'pred_boxes': c}
+                for a, b, c in zip(outputs_pos_match_score[:-1], outputs_neg_match_score[:-1], outputs_coord[:-1])]
 
 
 class SetCriterion(nn.Module):
@@ -86,7 +101,7 @@ class SetCriterion(nn.Module):
         1) we compute hungarian assignment between ground truth boxes and the outputs of the model
         2) we supervise each pair of matched ground-truth / prediction (supervise class and box)
     """
-    def __init__(self, num_classes, matcher, weight_dict, eos_coef, losses):
+    def __init__(self, num_queries, matcher, weight_dict, eos_coef, losses):
         """ Create the criterion.
         Parameters:
             num_classes: number of object categories, omitting the special no-object category
@@ -96,48 +111,33 @@ class SetCriterion(nn.Module):
             losses: list of all the losses to be applied. See get_loss for list of available losses.
         """
         super().__init__()
-        self.num_classes = num_classes
         self.matcher = matcher
         self.weight_dict = weight_dict
-        self.eos_coef = eos_coef
+        self.num_queries = num_queries
         self.losses = losses
-        empty_weight = torch.ones(self.num_classes + 1)
-        empty_weight[-1] = self.eos_coef
+        empty_weight = torch.ones(2)
+        empty_weight[0] = eos_coef
         self.register_buffer('empty_weight', empty_weight)
 
-    def loss_labels(self, outputs, targets, indices, num_boxes, log=True):
-        """Classification loss (NLL)
-        targets dicts must contain the key "labels" containing a tensor of dim [nb_target_boxes]
-        """
-        assert 'pred_logits' in outputs
-        src_logits = outputs['pred_logits']
+    def loss_match(self, outputs, targets, indices, num_boxes):
+        # """Classification loss (NLL)
+        # targets dicts must contain the key "labels" containing a tensor of dim [nb_target_boxes]
+        # """
+        assert 'pred_pos_match_scores' in outputs
+        assert 'pred_neg_match_scores' in outputs
+        src_pos_logits = outputs['pred_pos_match_scores']
+        src_neg_logits = outputs['pred_neg_match_scores']
+        src_logits = torch.cat([src_pos_logits, src_neg_logits], dim=1)
 
         idx = self._get_src_permutation_idx(indices)
-        target_classes_o = torch.cat([t["labels"][J] for t, (_, J) in zip(targets, indices)])
-        target_classes = torch.full(src_logits.shape[:2], self.num_classes,
-                                    dtype=torch.int64, device=src_logits.device)
-        target_classes[idx] = target_classes_o
+        target_classes = torch.full(src_pos_logits.shape[:2], 0, dtype=torch.int64, device=src_pos_logits.device)
+        target_classes[idx] = 1
+        target_classes_ = torch.full(src_neg_logits.shape[:2], 0, dtype=torch.int64, device=src_neg_logits.device)
+        target_classes = torch.cat([target_classes, target_classes_], dim=1)
 
-        loss_ce = F.cross_entropy(src_logits.transpose(1, 2), target_classes, self.empty_weight)
-        losses = {'loss_ce': loss_ce}
+        loss_match = F.cross_entropy(src_logits.transpose(1, 2), target_classes, self.empty_weight)
+        losses = {'loss_match': loss_match}
 
-        if log:
-            # TODO this should probably be a separate loss, not hacked in this one here
-            losses['class_error'] = 100 - accuracy(src_logits[idx], target_classes_o)[0]
-        return losses
-
-    @torch.no_grad()
-    def loss_cardinality(self, outputs, targets, indices, num_boxes):
-        """ Compute the cardinality error, ie the absolute error in the number of predicted non-empty boxes
-        This is not really a loss, it is intended for logging purposes only. It doesn't propagate gradients
-        """
-        pred_logits = outputs['pred_logits']
-        device = pred_logits.device
-        tgt_lengths = torch.as_tensor([len(v["labels"]) for v in targets], device=device)
-        # Count the number of predictions that are NOT "no-object" (which is the last class)
-        card_pred = (pred_logits.argmax(-1) != pred_logits.shape[-1] - 1).sum(1)
-        card_err = F.l1_loss(card_pred.float(), tgt_lengths.float())
-        losses = {'cardinality_error': card_err}
         return losses
 
     def loss_boxes(self, outputs, targets, indices, num_boxes):
@@ -204,8 +204,7 @@ class SetCriterion(nn.Module):
 
     def get_loss(self, loss, outputs, targets, indices, num_boxes, **kwargs):
         loss_map = {
-            'labels': self.loss_labels,
-            'cardinality': self.loss_cardinality,
+            'match': self.loss_match,
             'boxes': self.loss_boxes,
             'masks': self.loss_masks
         }
@@ -244,11 +243,7 @@ class SetCriterion(nn.Module):
                     if loss == 'masks':
                         # Intermediate masks losses are too costly to compute, we ignore them.
                         continue
-                    kwargs = {}
-                    if loss == 'labels':
-                        # Logging is enabled only for the last layer
-                        kwargs = {'log': False}
-                    l_dict = self.get_loss(loss, aux_outputs, targets, indices, num_boxes, **kwargs)
+                    l_dict = self.get_loss(loss, aux_outputs, targets, indices, num_boxes)
                     l_dict = {k + f'_{i}': v for k, v in l_dict.items()}
                     losses.update(l_dict)
 
@@ -331,8 +326,7 @@ def build(args):
     if args.masks:
         model = DETRsegm(model, freeze_detr=(args.frozen_weights is not None))
     matcher = build_matcher(args)
-    weight_dict = {'loss_ce': 1, 'loss_bbox': args.bbox_loss_coef}
-    weight_dict['loss_giou'] = args.giou_loss_coef
+    weight_dict = {'loss_match': args.match_loss_coef, 'loss_bbox': args.bbox_loss_coef, 'loss_giou': args.giou_loss_coef}
     if args.masks:
         weight_dict["loss_mask"] = args.mask_loss_coef
         weight_dict["loss_dice"] = args.dice_loss_coef
@@ -343,10 +337,10 @@ def build(args):
             aux_weight_dict.update({k + f'_{i}': v for k, v in weight_dict.items()})
         weight_dict.update(aux_weight_dict)
 
-    losses = ['labels', 'boxes', 'cardinality']
+    losses = ['match', 'boxes']
     if args.masks:
         losses += ["masks"]
-    criterion = SetCriterion(num_classes, matcher=matcher, weight_dict=weight_dict,
+    criterion = SetCriterion(num_queries=args.num_queries, matcher=matcher, weight_dict=weight_dict,
                              eos_coef=args.eos_coef, losses=losses)
     criterion.to(device)
     postprocessors = {'bbox': PostProcess()}
